@@ -50,6 +50,7 @@ import java.net.http.HttpResponse;
 import java.security.GeneralSecurityException;
 import java.security.KeyPair;
 import java.security.MessageDigest;
+import java.util.Array;
 import java.util.Arrays;
 import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
@@ -65,10 +66,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 public class InitialLoginSessionHandler implements MinecraftSessionHandler {
 
   private static final Logger logger = LogManager.getLogger(InitialLoginSessionHandler.class);
-  private static final String MOJANG_HASJOINED_URL =
-      System.getProperty("mojang.sessionserver",
-              "https://sessionserver.mojang.com/session/minecraft/hasJoined")
-          .concat("?username=%s&serverId=%s");
+  private static Array<String> MOJANG_HASJOINED_URLS = new Array<>();
+
 
   private final VelocityServer server;
   private final MinecraftConnection mcConnection;
@@ -85,6 +84,10 @@ public class InitialLoginSessionHandler implements MinecraftSessionHandler {
     this.inbound = Preconditions.checkNotNull(inbound, "inbound");
     this.forceKeyAuthentication = VelocityProperties.readBoolean(
             "auth.forceSecureProfiles", server.getConfiguration().isForceKeyAuthentication());
+
+    for (String url : System.getProperty("mojang.sessionservers", "https://sessionserver.mojang.com/session/minecraft/hasJoined").split(",")) {
+      MOJANG_HASJOINED_URLS.append(url.concat("?username=%s&serverId=%s"));
+    }
   }
 
   @Override
@@ -202,82 +205,89 @@ public class InitialLoginSessionHandler implements MinecraftSessionHandler {
       String serverId = generateServerId(decryptedSharedSecret, serverKeyPair.getPublic());
 
       String playerIp = ((InetSocketAddress) mcConnection.getRemoteAddress()).getHostString();
-      String url = String.format(MOJANG_HASJOINED_URL,
-          urlFormParameterEscaper().escape(login.getUsername()), serverId);
 
-      if (server.getConfiguration().shouldPreventClientProxyConnections()) {
-        url += "&ip=" + urlFormParameterEscaper().escape(playerIp);
+      for (String url : MOJANG_HASJOINED_URLS) {
+        String formattedURL = String.format(MOJANG_HASJOINED_URL,
+                urlFormParameterEscaper().escape(login.getUsername()), serverId);
+
+        if (server.getConfiguration().shouldPreventClientProxyConnections()) {
+          formattedURL += "&ip=" + urlFormParameterEscaper().escape(playerIp);
+        }
+
+        final HttpRequest httpRequest = HttpRequest.newBuilder()
+                .setHeader("User-Agent",
+                        server.getVersion().getName() + "/" + server.getVersion().getVersion())
+                .uri(URI.create(formattedURL))
+                .build();
+        final HttpClient httpClient = server.createHttpClient();
+        httpClient.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofString())
+                .whenCompleteAsync((response, throwable) -> {
+                  if (mcConnection.isClosed()) {
+                    // The player disconnected after we authenticated them.
+                    return;
+                  }
+
+                  if (throwable != null) {
+                    logger.info("Unable to authenticate player via authentication server %s.", url, throwable);
+                    inbound.disconnect(Component.translatable("multiplayer.disconnect.authservers_down"));
+                    return;
+                  }
+
+                  // Go ahead and enable encryption. Once the client sends EncryptionResponse, encryption
+                  // is enabled.
+                  try {
+                    mcConnection.enableEncryption(decryptedSharedSecret);
+                  } catch (GeneralSecurityException e) {
+                    logger.error("Unable to enable encryption for connection", e);
+                    // At this point, the connection is encrypted, but something's wrong on our side and
+                    // we can't do anything about it.
+                    mcConnection.close(true);
+                    return;
+                  }
+
+                  if (response.statusCode() == 200) {
+                    final GameProfile profile = GENERAL_GSON.fromJson(response.body(),
+                            GameProfile.class);
+                    // Not so fast, now we verify the public key for 1.19.1+
+                    if (inbound.getIdentifiedKey() != null
+                            && inbound.getIdentifiedKey().getKeyRevision() == IdentifiedKey.Revision.LINKED_V2
+                            && inbound.getIdentifiedKey() instanceof final IdentifiedKeyImpl key) {
+                      if (!key.internalAddHolder(profile.getId())) {
+                        inbound.disconnect(
+                                Component.translatable("multiplayer.disconnect.invalid_public_key"));
+                      }
+                    }
+                    // All went well, initialize the session.
+                    mcConnection.setActiveSessionHandler(StateRegistry.LOGIN,
+                            new AuthSessionHandler(server, inbound, profile, true));
+                  } else if (response.statusCode() == 204) {
+                    // Apparently an offline-mode user logged onto this online-mode proxy.
+                    inbound.disconnect(
+                            Component.translatable("velocity.error.online-mode-only", NamedTextColor.RED));
+                  } else {
+                    // Something else went wrong
+                    logger.error(
+                            "Got an unexpected error code {} whilst contacting Mojang to log in {} ({})",
+                            response.statusCode(), login.getUsername(), playerIp);
+                    inbound.disconnect(Component.translatable("multiplayer.disconnect.authservers_down"));
+                  }
+                }, mcConnection.eventLoop())
+                .thenRun(() -> {
+                  if (httpClient instanceof final AutoCloseable closeable) {
+                    try {
+                      closeable.close();
+                    } catch (Exception e) {
+                      // In Java 21, the HttpClient does not throw any Exception
+                      // when trying to clean its resources, so this should not happen
+                      logger.error("An unknown error occurred while trying to close an HttpClient", e);
+                    }
+                  }
+                });
       }
 
-      final HttpRequest httpRequest = HttpRequest.newBuilder()
-              .setHeader("User-Agent",
-                      server.getVersion().getName() + "/" + server.getVersion().getVersion())
-              .uri(URI.create(url))
-              .build();
-      final HttpClient httpClient = server.createHttpClient();
-      httpClient.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofString())
-          .whenCompleteAsync((response, throwable) -> {
-            if (mcConnection.isClosed()) {
-              // The player disconnected after we authenticated them.
-              return;
-            }
+      inbound.disconnect(Component.translatable("multiplayer.disconnect.authservers_down"));
+      return;
 
-            if (throwable != null) {
-              logger.error("Unable to authenticate player", throwable);
-              inbound.disconnect(Component.translatable("multiplayer.disconnect.authservers_down"));
-              return;
-            }
-
-            // Go ahead and enable encryption. Once the client sends EncryptionResponse, encryption
-            // is enabled.
-            try {
-              mcConnection.enableEncryption(decryptedSharedSecret);
-            } catch (GeneralSecurityException e) {
-              logger.error("Unable to enable encryption for connection", e);
-              // At this point, the connection is encrypted, but something's wrong on our side and
-              // we can't do anything about it.
-              mcConnection.close(true);
-              return;
-            }
-
-            if (response.statusCode() == 200) {
-              final GameProfile profile = GENERAL_GSON.fromJson(response.body(),
-                  GameProfile.class);
-              // Not so fast, now we verify the public key for 1.19.1+
-              if (inbound.getIdentifiedKey() != null
-                  && inbound.getIdentifiedKey().getKeyRevision() == IdentifiedKey.Revision.LINKED_V2
-                  && inbound.getIdentifiedKey() instanceof final IdentifiedKeyImpl key) {
-                if (!key.internalAddHolder(profile.getId())) {
-                  inbound.disconnect(
-                      Component.translatable("multiplayer.disconnect.invalid_public_key"));
-                }
-              }
-              // All went well, initialize the session.
-              mcConnection.setActiveSessionHandler(StateRegistry.LOGIN,
-                  new AuthSessionHandler(server, inbound, profile, true));
-            } else if (response.statusCode() == 204) {
-              // Apparently an offline-mode user logged onto this online-mode proxy.
-              inbound.disconnect(
-                  Component.translatable("velocity.error.online-mode-only", NamedTextColor.RED));
-            } else {
-              // Something else went wrong
-              logger.error(
-                  "Got an unexpected error code {} whilst contacting Mojang to log in {} ({})",
-                  response.statusCode(), login.getUsername(), playerIp);
-              inbound.disconnect(Component.translatable("multiplayer.disconnect.authservers_down"));
-            }
-          }, mcConnection.eventLoop())
-          .thenRun(() -> {
-            if (httpClient instanceof final AutoCloseable closeable) {
-              try {
-                closeable.close();
-              } catch (Exception e) {
-                // In Java 21, the HttpClient does not throw any Exception
-                // when trying to clean its resources, so this should not happen
-                logger.error("An unknown error occurred while trying to close an HttpClient", e);
-              }
-            }
-          });
     } catch (GeneralSecurityException e) {
       logger.error("Unable to enable encryption", e);
       mcConnection.close(true);
